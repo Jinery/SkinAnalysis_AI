@@ -1,6 +1,9 @@
+import numpy as np
 from keras.src.layers.preprocessing.image_preprocessing.random_flip import HORIZONTAL
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.layers import BatchNormalization, GlobalAveragePooling2D
+
+from sklearn.utils.class_weight import compute_class_weight
 
 import utils as ut
 import tensorflow as tf
@@ -121,13 +124,26 @@ def build_model(class_counts: int):
 
 def train_model():
     """Main training pipeline for the model."""
-    print("[1/6] Creating data pipeline...")
+    print("[1/8] Creating data pipeline...")
     train_dataset, validation_dataset, class_names, class_counts = create_data_pipeline()
 
-    print("[2/6] Building model architecture...")
+    print("[2/8] Calculating class weights...")
+    y_train = np.concatenate([y for x, y in train_dataset], axis=0)
+    y_train_indicies = np.argmax(y_train, axis=1)
+
+    classes = np.unique(y_train_indicies)
+    weights = compute_class_weight(
+        class_weight="balanced",
+        classes=classes,
+        y=y_train_indicies,
+    )
+    class_weights_dict = dict(zip(classes, weights))
+    print(f"Class weights: {class_weights_dict}")
+
+    print("[3/8] Building model architecture...")
     model = build_model(class_counts)
 
-    print("[3/6] Setting callbacks...")
+    print("[4/8] Setting callbacks...")
     model_path, weights_path = ut.get_model_and_weights_name()
     # Callbacks for better training control.
     callbacks = [
@@ -136,22 +152,51 @@ def train_model():
         ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=2, min_lr=1e-7, verbose=1) # Reduce learning rate when loss plateaus.
     ]
 
-    print(f"\n[4/6] Training model for {EPOCH} epochs...")
+    print(f"\n[5/8] Training model for {EPOCH} epochs...")
     print("-" * 40)
-    # Train the model
+    # Train the model with initial configuration.
     history = model.fit(
         train_dataset,
+        validation_data=validation_dataset,  # Dataset for validation metrics
+        epochs=EPOCH,  # Number of training epochs
+        callbacks=callbacks,  # Training callbacks for monitoring and control
+        class_weight=class_weights_dict,  # Class weights to handle imbalance
+        verbose=1  # Show progress bar and metrics
+    )
+
+    print("\n[6/8] Fine-tuning...")
+    model.trainable = True # Unfreeze the base model for fine-tuning - allow pre-trained layers to adapt.
+    # Recompile with lower learning rate for fine-tuning (prevovershoot).
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-6),  # Very low LR for fine-tuning
+        loss='categorical_crossentropy',
+        metrics=[
+            'accuracy',
+            tf.keras.metrics.Precision(name='precision'),  # Rename for clarity
+            tf.keras.metrics.Recall(name='recall')
+        ]
+    )
+    # Special callbacks for fine-tuning phase.
+    callbacks_fine = [
+        EarlyStopping(monitor='val_recall', patience=3, restore_best_weights=True, mode='max'),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-8)
+    ]
+
+    # Fine-tune the model for a few epochs with all layers trainable.
+    model.fit(
+        train_dataset,
         validation_data=validation_dataset,
-        epochs=EPOCH,
-        callbacks=callbacks,
+        epochs=7,  # Short fine-tuning phase
+        callbacks=callbacks_fine,
+        class_weight=class_weights_dict,
         verbose=1
     )
 
-    print("\n[5/6] Saving model and generating visualizations...")
+    print("\n[7/8] Saving model and generating visualizations...")
     model.save(model_path) # Save entire model architecture + weights.
     print(f"Model saved to: {model_path}")
 
-    print("\n[6/6] Painting training and validation data...")
+    print("\n[8/8] Painting training and validation data...")
     pnt.plot_training_history(history) # Visualize training progress.
 
 if __name__ == "__main__":
